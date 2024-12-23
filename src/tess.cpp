@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+
 namespace fs = std::filesystem;
 
 // Task structure
@@ -29,6 +30,8 @@ bool finished = false;
 // Statistics
 std::atomic<int> total_files(0);
 std::atomic<int> downloaded_files(0);
+std::atomic<int> sh_files_downloaded(0);
+std::mutex output_mutex;
 
 void show_progress_bar(int total, int downloaded)
 {
@@ -36,6 +39,7 @@ void show_progress_bar(int total, int downloaded)
     float progress = static_cast<float>(downloaded) / total;
     int pos = static_cast<int>(progress * bar_width);
 
+    std::lock_guard<std::mutex> lock(output_mutex);
     std::cout << "[";
     for (int i = 0; i < bar_width; ++i)
     {
@@ -48,6 +52,44 @@ void show_progress_bar(int total, int downloaded)
     }
     std::cout << "] " << int(progress * 100.0) << "% (" << downloaded << "/" << total << ")\r";
     std::cout.flush();
+}
+
+void download_sh_files(int start_sector, int end_sector, const std::string &output_dir, int thread_count)
+{
+    std::atomic<int> sector_index(start_sector);
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < thread_count; ++i)
+    {
+        threads.emplace_back([&]() {
+            int sector;
+            while ((sector = sector_index++) <= end_sector)
+            {
+                std::string sh_url =
+                    "https://archive.stsci.edu/missions/tess/download_scripts/sector/tesscurl_sector_" +
+                    std::to_string(sector) + "_lc.sh";
+                std::string sh_file = output_dir + "/tesscurl_sector_" + std::to_string(sector) + "_lc.sh";
+
+                if (!fs::exists(sh_file))
+                {
+#ifdef _WIN32
+                    std::string command = "curl -L -o " + sh_file + " \"" + sh_url + "\" > nul 2>&1";
+#else
+                    std::string command = "curl -L -o " + sh_file + " \"" + sh_url + "\" > /dev/null 2>&1";
+#endif
+                    system(command.c_str());
+                }
+                sh_files_downloaded++;
+                show_progress_bar(end_sector - start_sector + 1, sh_files_downloaded);
+            }
+        });
+    }
+
+    for (auto &t : threads)
+    {
+        t.join();
+    }
+    std::cout << std::endl;
 }
 
 void worker()
@@ -67,40 +109,31 @@ void worker()
         const std::string &url = task.url;
         const std::string &output_file = task.output_file;
 
-        if (!fs::exists(output_file))
-        {
-            std::string command = "curl -C - -L -o \"" + output_file + "\" \"" + url + "\" > /dev/null 2>&1";
-            int ret = system(command.c_str());
-            if (ret == 0)
-            {
-                downloaded_files++;
-            }
-            else
-            {
-                std::cerr << "Download failed: " << url << std::endl;
-            }
-        }
-        else
+#ifdef _WIN32
+        std::string command = "curl -C - -L -o \"" + output_file + "\" \"" + url + "\" > nul 2>&1";
+#else
+        std::string command = "curl -C - -L -o \"" + output_file + "\" \"" + url + "\" > /dev/null 2>&1";
+#endif
+        int ret = system(command.c_str());
+        if (ret == 0)
         {
             downloaded_files++;
         }
-
         show_progress_bar(total_files, downloaded_files);
     }
 }
 
 void print_help()
 {
-    std::cout << "Usage: tess_downloader [OPTIONS]\n"
-              << "Options:\n"
-              << "  -h, --help          Show this help message and exit\n"
-              << "  --start=SECTOR      Specify the start sector (default: 1)\n"
-              << "  --end=SECTOR        Specify the end sector (default: 83)\n"
-              << "  --threads=NUM       Specify the number of threads to use "
-                 "(default: number of hardware threads)\n"
-              << "  --output-dir=DIR    Specify the output directory for "
-                 "downloaded files (default: current directory)\n"
-              << std::endl;
+    std::cout
+        << "Usage: tess_downloader [OPTIONS]\n"
+        << "Options:\n"
+        << "  -h, --help          Show this help message and exit\n"
+        << "  --start=SECTOR      Specify the start sector (default: 1)\n"
+        << "  --end=SECTOR        Specify the end sector (default: 83)\n"
+        << "  --threads=NUM       Specify the number of threads to use (default: number of hardware threads)\n"
+        << "  --output-dir=DIR    Specify the output directory for downloaded files (default: current directory)\n"
+        << std::endl;
 }
 
 void download_and_parse_tasks(std::vector<Task> &tasks, int start_sector, int end_sector, const std::string &output_dir,
@@ -116,23 +149,7 @@ void download_and_parse_tasks(std::vector<Task> &tasks, int start_sector, int en
             int sector;
             while ((sector = sector_index++) <= end_sector)
             {
-                std::string sh_url = "https://archive.stsci.edu/missions/tess/"
-                                     "download_scripts/sector/tesscurl_sector_" +
-                                     std::to_string(sector) + "_lc.sh";
                 std::string sh_file = output_dir + "/tesscurl_sector_" + std::to_string(sector) + "_lc.sh";
-
-                if (!fs::exists(sh_file))
-                {
-                    std::cout << "Downloading SH file: " << sh_file << std::endl;
-                    std::string command = "curl -L -o " + sh_file + " \"" + sh_url + "\"";
-                    int ret = system(command.c_str());
-                    if (ret != 0)
-                    {
-                        std::cerr << "Failed to download SH file: " << sh_url << std::endl;
-                        continue;
-                    }
-                }
-
                 std::string sector_folder = output_dir + "/T" + std::to_string(sector);
                 if (!fs::exists(sector_folder))
                 {
@@ -232,6 +249,8 @@ int main(int argc, char *argv[])
             }
         }
     }
+
+    download_sh_files(start_sector, end_sector, output_dir, thread_count);
 
     // Parse sectors and initialize task queue
     std::vector<Task> tasks;

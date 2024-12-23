@@ -1,6 +1,6 @@
 add_languages("cxx20")
 
-target("TESS-Downloader")
+target("TESS_Downloader")
     set_kind("binary")
     set_encodings("utf-8")
 
